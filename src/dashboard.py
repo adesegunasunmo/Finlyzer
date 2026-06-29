@@ -1,3 +1,11 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))  
+
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))  
+
 from src.auth import require_auth, is_admin, is_viewer
 from src.db import (
     get_db_path, get_all_complaints,
