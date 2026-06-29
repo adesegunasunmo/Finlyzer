@@ -426,7 +426,7 @@ with tab_agent:
             df["Customer_ID"].str.upper().str.contains(q, na=False) |
             df["Complaint_ID"].str.upper().str.contains(q, na=False) |
             df["Customer_Email"].str.upper().str.contains(q, na=False) |
-            df["Phone"].str.contains(cust_search.strip(), na=False)
+            df["Phone"].astype(str).str.contains(cust_search.strip(), na=False)
         ]
 
         if hits.empty:
