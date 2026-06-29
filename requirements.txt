@@ -8,4 +8,4 @@ openpyxl
 scipy
 spacy>=3.5.0
 transformers>=4.30.0
-torch --index-url https://download.pytorch.org/whl/cpu
+torch
