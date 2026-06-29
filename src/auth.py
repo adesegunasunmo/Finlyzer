@@ -1,7 +1,6 @@
 """
 Module: auth.py
-Purpose: Authentication with role-based access (admin/viewer),
-         login attempt limiting, and audit logging.
+Purpose: Authentication — env-var mode (dev) + SQLite user accounts (production).
 """
 
 import os
@@ -12,82 +11,49 @@ from typing import Literal, Optional
 
 import streamlit as st
 
-# Configuration
 PASSWORD_ENV = "STREAMLIT_PASSWORD"
 ADMIN_PASSWORD_ENV = "STREAMLIT_ADMIN_PASSWORD"
-MAX_ATTEMPTS = 3
-ATTEMPT_TIMEOUT_MINUTES = 15
+MAX_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
 
-# Absolute path so it works regardless of working directory or Streamlit Cloud CWD
 _BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _LOG_DIR = os.path.join(_BASE_DIR, "data")
 os.makedirs(_LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(_LOG_DIR, "auth.log")
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def check_password_strength(password: str) -> tuple[bool, str]:
-    """Validate password meets minimum security requirements."""
-    if len(password) < 8:
-        return False, "Password must be at least 8 characters"
-    if not any(c.isupper() for c in password):
-        return False, "Password must contain at least one uppercase letter"
-    if not any(c.islower() for c in password):
-        return False, "Password must contain at least one lowercase letter"
-    if not any(c.isdigit() for c in password):
-        return False, "Password must contain at least one number"
-    return True, "Password meets requirements"
-
-
-def log_attempt(success: bool, username: str, ip: Optional[str] = None):
-    """Log login attempts with timestamp and outcome."""
-    msg = {
-        "timestamp": datetime.now().isoformat(),
-        "success": success,
-        "username": username,
-        "ip": ip or "unknown",
-    }
+def _log(success: bool, username: str):
     try:
-        logging.info(json.dumps(msg))
+        logging.info(json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "success": success, "username": username
+        }))
     except Exception:
-        pass  # Never crash the app over a logging failure
+        pass
 
 
 def get_remaining_attempts() -> int:
-    """Return how many login attempts remain before lockout."""
-    if "login_attempts" not in st.session_state:
-        st.session_state.login_attempts = 0
+    st.session_state.setdefault("login_attempts", 0)
     return MAX_ATTEMPTS - st.session_state.login_attempts
 
 
 def require_auth() -> tuple[bool, Literal["admin", "viewer", None]]:
-    """
-    Show login form or return current auth state.
-    Returns (authenticated: bool, role: "admin" | "viewer" | None).
-    """
-
-    # Already authenticated — dashboard handles the logout button
     if st.session_state.get("authenticated"):
-        role = st.session_state.get("role", "viewer")
-        return True, role
+        return True, st.session_state.get("role", "viewer")
 
-    # Initialize attempt counter
-    if "login_attempts" not in st.session_state:
-        st.session_state.login_attempts = 0
+    st.session_state.setdefault("login_attempts", 0)
 
-    # Lockout check
     if st.session_state.login_attempts >= MAX_ATTEMPTS:
         st.error(
-            f"Too many failed attempts. Please try again in {ATTEMPT_TIMEOUT_MINUTES} minutes."
-        )
+            f"Too many failed attempts. Try again in {LOCKOUT_MINUTES} minutes.")
         return False, None
 
-    # Read passwords from environment / Streamlit secrets
+    # Read credentials — try DB users first, fall back to env vars
+    admin_pw = ""
+    viewer_pw = ""
     try:
         admin_pw = os.getenv(ADMIN_PASSWORD_ENV) or st.secrets.get(
             ADMIN_PASSWORD_ENV, "")
@@ -96,66 +62,78 @@ def require_auth() -> tuple[bool, Literal["admin", "viewer", None]]:
         admin_pw = os.getenv(ADMIN_PASSWORD_ENV, "")
         viewer_pw = os.getenv(PASSWORD_ENV, "")
 
-    if not (admin_pw or viewer_pw):
-        st.warning(
-            "No passwords configured. Set STREAMLIT_PASSWORD and/or "
-            "STREAMLIT_ADMIN_PASSWORD in your environment or Streamlit secrets."
-        )
-        # Default to viewer access so the app is still usable during development
-        return True, "viewer"
-
-    # Login form
-    st.markdown("### 🏦 Finlyzer — Login")
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
+    st.markdown("### 🏦 Finlyzer — Secure Login")
+    c1, c2 = st.columns([3, 1])
+    with c1:
         username = st.text_input("Username", key="login_username")
         password = st.text_input(
             "Password", type="password", key="login_password")
-
-    with col2:
+    with c2:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        login_clicked = st.button("Login", use_container_width=True)
+        clicked = st.button("Login", use_container_width=True)
 
-    if login_clicked:
+    # Also try DB-based login
+    db_user = None
+    if clicked and username and password:
+        try:
+            from src.db import verify_user, get_db_path
+            db_path = get_db_path()
+            if os.path.exists(db_path):
+                db_user = verify_user(username, password, db_path)
+        except Exception:
+            pass
+
+    if clicked:
         if not username:
             st.error("Username is required.")
             return False, None
 
-        if admin_pw and password == admin_pw:
-            st.session_state.authenticated = True
-            st.session_state.role = "admin"
-            st.session_state.username = username
-            st.session_state.login_attempts = 0
-            log_attempt(True, username)
-            st.rerun()
+        authenticated = False
+        role = None
 
+        if db_user:
+            authenticated = True
+            role = db_user.get("Role", "viewer")
+        elif admin_pw and password == admin_pw:
+            authenticated = True
+            role = "admin"
         elif viewer_pw and password == viewer_pw:
+            authenticated = True
+            role = "viewer"
+
+        if authenticated:
             st.session_state.authenticated = True
-            st.session_state.role = "viewer"
+            st.session_state.role = role
             st.session_state.username = username
             st.session_state.login_attempts = 0
-            log_attempt(True, username)
+            _log(True, username)
             st.rerun()
-
         else:
             st.session_state.login_attempts += 1
-            log_attempt(False, username)
+            _log(False, username)
             remaining = get_remaining_attempts()
             st.error(f"Invalid credentials. {remaining} attempt(s) remaining.")
 
+    if not (admin_pw or viewer_pw):
+        st.info("No passwords configured — set STREAMLIT_PASSWORD / STREAMLIT_ADMIN_PASSWORD, "
+                "or create users via the admin panel.")
+        # Allow anonymous viewer access in dev
+        if st.button("Continue as guest (viewer)"):
+            st.session_state.authenticated = True
+            st.session_state.role = "viewer"
+            st.session_state.username = "guest"
+            st.rerun()
+
     remaining = get_remaining_attempts()
     if remaining < MAX_ATTEMPTS:
-        st.warning(f"{remaining} login attempt(s) remaining before lockout.")
+        st.warning(f"{remaining} login attempt(s) remaining.")
 
     return False, None
 
 
 def is_admin() -> bool:
-    """True if the current user has the admin role."""
     return st.session_state.get("role") == "admin"
 
 
 def is_viewer() -> bool:
-    """True if the current user has at least viewer access (admin or viewer)."""
     return st.session_state.get("role") in ("admin", "viewer")
